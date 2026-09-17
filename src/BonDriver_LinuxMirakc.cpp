@@ -7,6 +7,8 @@
 
 #include <string.h>
 #include <dlfcn.h>
+#include <exception>
+#include <vector>
 
 static void Init_set_default_value(void);
 
@@ -23,18 +25,32 @@ static int Init()
 		return -1;
 	}
 
-	sprintf( ini_filename, "%s.ini", info.dli_fname );
+	int written = snprintf( ini_filename, sizeof(ini_filename), "%s.ini", info.dli_fname );
+	if( written < 0 || (size_t)written >= sizeof(ini_filename) ) {
+		// パスが長すぎてini_filenameバッファに収まらない。iniが読めないだけなので
+		// チューナー生成自体は失敗させず、config.Load()を失敗させてデフォルト値に
+		// フォールバックさせる
+		ERROR_OUTPUT1("module path too long to build ini filename. load default value");
+		ini_filename[0] = '\0';
+	}
 
 	// チューナー名は .so を除いたファイル名とする（お尻は無条件に３文字削る）
 	char *p;
-	
+	const char *base_name;
+	size_t full_len, name_len;
+
 	p = strrchr( (char *)info.dli_fname, '/' );
-	if( p == NULL ) {
-		::memcpy( g_TunerName, info.dli_fname, strlen( info.dli_fname ) - 3);
+	base_name = ( p == NULL ) ? info.dli_fname : p + 1;
+
+	full_len = strlen( base_name );
+	// ファイル名が3文字以下の場合に size_t の引き算で桁あふれしないようにガードする
+	name_len = ( full_len > 3 ) ? ( full_len - 3 ) : 0;
+	// g_TunerName のバッファ（終端の1バイトを除く）を超えないようにクランプする
+	if( name_len > sizeof( g_TunerName ) - 1 ) {
+		name_len = sizeof( g_TunerName ) - 1;
 	}
-	else {
-		::memcpy( g_TunerName, p + 1, strlen( p + 1 ) - 3);
-	}
+	::memcpy( g_TunerName, base_name, name_len );
+	g_TunerName[ name_len ] = '\0';
 	
 	// load ini file
 	Config config;
@@ -54,7 +70,8 @@ static int Init()
 
 	sec_global = config.Get( "GLOBAL" );
 
-	strcpy( g_ServerHost, sec_global.Get("SERVER_HOST", "127.0.0.1" ).c_str() );
+	strncpy( g_ServerHost, sec_global.Get("SERVER_HOST", "127.0.0.1" ).c_str(), sizeof( g_ServerHost ) - 1 );
+	g_ServerHost[ sizeof( g_ServerHost ) - 1 ] = '\0';
 	g_ServerPort = sec_global.Get("SERVER_PORT", 40772 );
 	g_DecodeB25 = sec_global.Get("DECODE_B25", 0 );
 	g_Priority = sec_global.Get("PRIORITY", 1 );
@@ -84,28 +101,41 @@ static void Init_set_default_value(void)
 
 extern "C" IBonDriver * CreateBonDriver()
 {
-	if( CBonTuner::m_pThis != NULL ) {
-		return CBonTuner::m_pThis;
+	try {
+		if( CBonTuner::m_pThis != NULL ) {
+			return CBonTuner::m_pThis;
+		}
+		
+		int ret;
+		
+		ret = Init();
+		if( ret < 0 ) {
+			return NULL;
+		}
+
+		DEBUG_OUTPUT("SERVER_HOST:%s", g_ServerHost);
+		DEBUG_OUTPUT("SERVER_PORT:%d", g_ServerPort);
+		DEBUG_OUTPUT("SERVER_SOCKPATH:%s", g_ServerSockpath);
+
+		DEBUG_OUTPUT("SERVER_TYPE:%s", g_ServerType);
+
+		DEBUG_OUTPUT("DECODE_B25:%d", g_DecodeB25);
+		DEBUG_OUTPUT("PRIORITY:%d", g_Priority);
+		DEBUG_OUTPUT("SERVICE_SPLIT:%d", g_Service_Split);
+
+		return (IBonDriver *) new CBonTuner;
 	}
-	
-	int ret;
-	
-	ret = Init();
-	if( ret < 0 ) {
+	catch (const std::exception& e) {
+		// extern "C" 境界を越えて例外を伝播させると未定義動作になり、
+		// ホストアプリ全体をクラッシュさせかねない（Init()内のstd::string/
+		// std::unordered_map操作や new でのstd::bad_alloc等が経路になりうる）。
+		ERROR_OUTPUT( "CreateBonDriver: exception (%s)", e.what() );
 		return NULL;
 	}
-
-	DEBUG_OUTPUT("SERVER_HOST:%s", g_ServerHost);
-	DEBUG_OUTPUT("SERVER_PORT:%d", g_ServerPort);
-	DEBUG_OUTPUT("SERVER_SOCKPATH:%s", g_ServerSockpath);
-
-	DEBUG_OUTPUT("SERVER_TYPE:%s", g_ServerType);
-
-	DEBUG_OUTPUT("DECODE_B25:%d", g_DecodeB25);
-	DEBUG_OUTPUT("PRIORITY:%d", g_Priority);
-	DEBUG_OUTPUT("SERVICE_SPLIT:%d", g_Service_Split);
-
-	return (IBonDriver *) new CBonTuner;
+	catch (...) {
+		ERROR_OUTPUT1( "CreateBonDriver: unknown exception" );
+		return NULL;
+	}
 }
 
 // 静的メンバ初期化
@@ -120,6 +150,9 @@ CBonTuner::CBonTuner()
 	m_dwCurChannel = 0xffffffff;
 
 	m_hRecvThread = 0;
+	m_bRecvThreadValid = false;
+
+	conn = NULL;
 
 	// GrabTsDataインスタンス作成
 	m_pGrabTsData = new GrabTsData();
@@ -146,6 +179,11 @@ const BOOL CBonTuner::OpenTuner()
 	DEBUG_CALL("");
 
 	DEBUG_OUTPUT1("Start");
+
+	// 既に開かれている場合（再Open）に備えて、まず確実に閉じてから始める。
+	// これをしないと、古い conn オブジェクトや g_pType の確保領域が
+	// 解放されずに上書きされ、リークの原因になる。
+	CloseTuner();
 
 	while (1) {
 		conn = NULL;
@@ -198,16 +236,24 @@ void CBonTuner::CloseTuner()
 	m_dwCurChannel = 0xffffffff;
 
 	// スレッド終了
-	if (m_hRecvThread) {
+	if (m_bRecvThreadValid) {
 		conn->shutdown();
+		// conn->shutdown()はソケットI/O(recv())のブロックしか解除できない。
+		// 送信スレッドがリングバッファ満杯でput_TsStream()内のpthread_cond_wait
+		// にブロックしている場合はこれでは起きないため、別途明示的に知らせる。
+		if (m_pGrabTsData) {
+			m_pGrabTsData->RequestShutdown();
+		}
 		pthread_join(m_hRecvThread, NULL);
 		m_hRecvThread = 0;
+		m_bRecvThreadValid = false;
 	}
 
 	// チューニング空間解放
 	for (int i = 0; i <= g_Max_Type; i++) {
 		if (g_pType[i]) {
 			free(g_pType[i]);
+			g_pType[i] = NULL; // 解放後にダングリングポインタとして残さない
 		}
 	}
 	g_Max_Type = -1;
@@ -250,6 +296,11 @@ const DWORD CBonTuner::GetReadyCount()
 const BOOL CBonTuner::GetTsStream(BYTE *pDst, DWORD *pdwSize, DWORD *pdwRemain)
 {
 	DEBUG_CALL("");
+
+	if (pDst == NULL || pdwSize == NULL) {
+		// pDst/pdwSizeがNULLで呼ばれた場合のヌルポインタ参照を防止
+		return FALSE;
+	}
 
 	BYTE *pSrc = NULL;
 
@@ -304,9 +355,10 @@ LPCTSTR CBonTuner::GetTunerName(void)
 	DEBUG_OUTPUT1("Called");
 
 	// チューナ名を返す
-
-	static WCHAR buf[ 64 ];
-	m_cv.Utf8ToUtf16(TUNER_NAME, buf );
+	// スレッド間でバッファを共有すると、複数スレッドから同時に呼ばれた場合に
+	// 内容が競合・破損する可能性があるため、スレッドごとに独立したバッファにする
+	thread_local WCHAR buf[ 64 ];
+	m_cv.Utf8ToUtf16(TUNER_NAME, buf, sizeof(buf) );
 	
 	return buf;
 }
@@ -316,7 +368,11 @@ const BOOL CBonTuner::IsTunerOpening(void)
 	DEBUG_CALL("");
 	DEBUG_OUTPUT1("Called");
 
-	return FALSE; // todo?
+	// このBonDriverのOpenTuner()は同期処理のため、外部から観測できる
+	// 「オープン処理中」という遷移状態は存在しない。
+	// ホスト側がこの関数を「チューナーが開いているか」の判断に使うことがあるため、
+	// 常にFALSEを返すのではなく実際の接続状態を反映する。
+	return (conn != NULL) ? TRUE : FALSE;
 }
 
 LPCTSTR CBonTuner::EnumTuningSpace(const DWORD dwSpace)
@@ -330,8 +386,10 @@ LPCTSTR CBonTuner::EnumTuningSpace(const DWORD dwSpace)
 	// 使用可能なチューニング空間を返す
 	const int len = 8;
 
-	static WCHAR buf[len];
-	m_cv.Utf8ToUtf16( g_pType[dwSpace], buf );
+	// スレッドごとに独立したバッファにして、複数スレッドからの同時呼び出しによる
+	// 内容の競合・破損を防ぐ
+	thread_local WCHAR buf[len];
+	m_cv.Utf8ToUtf16( g_pType[dwSpace], buf, sizeof(buf) );
 
 	return buf;
 }
@@ -343,27 +401,35 @@ LPCTSTR CBonTuner::EnumChannelName(const DWORD dwSpace, const DWORD dwChannel)
 	if ((int32_t)dwSpace > g_Max_Type) {
 		return NULL;
 	}
-	if ((int32_t)dwSpace < g_Max_Type) {
-		if (dwChannel >= g_Channel_Base[dwSpace + 1] - g_Channel_Base[dwSpace]) {
-			return NULL;
-		}
-	}
-
 	DWORD Bon_Channel = dwChannel + g_Channel_Base[dwSpace];
 	if (!g_Channel_JSON.contains(Bon_Channel)) {
 		return NULL;
 	}
+	if ((int32_t)dwSpace < g_Max_Type) {
+		if (Bon_Channel >= g_Channel_Base[dwSpace + 1]) {
+			return NULL;
+		}
+	}
 
-	picojson::object& channel_obj =
-		g_Channel_JSON.get(Bon_Channel).get<picojson::object>();
+	try {
+		picojson::object& channel_obj =
+			g_Channel_JSON.get(Bon_Channel).get<picojson::object>();
 
-	// 使用可能なチャンネル名を返す
-	const int len = 128;
+		// 使用可能なチャンネル名を返す
+		const int len = 128;
 
-	static WCHAR buf[len];
-	m_cv.Utf8ToUtf16( channel_obj["name"].get<std::string>().c_str(), buf );
+		// スレッドごとに独立したバッファにして、複数スレッドからの同時呼び出しによる
+		// 内容の競合・破損を防ぐ
+		thread_local WCHAR buf[len];
+		m_cv.Utf8ToUtf16( channel_obj["name"].get<std::string>().c_str(), buf, sizeof(buf) );
 
-	return buf;
+		return buf;
+	}
+	catch (const std::exception& e) {
+		// mirakcが想定外のJSON構造を返した場合に、例外をホスト側へ伝播させない
+		ERROR_OUTPUT( "EnumChannelName: JSON access exception (%s)", e.what() );
+		return NULL;
+	}
 }
 
 
@@ -398,6 +464,12 @@ const BOOL CBonTuner::SetChannel(const DWORD dwSpace, const DWORD dwChannel)
 	DEBUG_CALL("");
 	DEBUG_OUTPUT("Start(sp:%d, ch:%d)", dwSpace, dwChannel);
 
+	if (conn == NULL) {
+		// OpenTuner() が成功していない状態で呼ばれた場合のNULL参照防止
+		ERROR_OUTPUT1( "SetChannel: called while tuner is not open (conn is NULL)" );
+		return FALSE;
+	}
+
 	conn->shutdown();
 
 	if ((int32_t)dwSpace > g_Max_Type) {
@@ -410,37 +482,57 @@ const BOOL CBonTuner::SetChannel(const DWORD dwSpace, const DWORD dwChannel)
 		DEBUG_OUTPUT1("end(failed) (invalid channel)");
 		return FALSE;
 	}
-
-	picojson::object& channel_obj =
-		g_Channel_JSON.get(Bon_Channel).get<picojson::object>();
+	// dwChannel が次のチューニング空間にはみ出していないかチェック（EnumChannelNameと同様）
+	if ((int32_t)dwSpace < g_Max_Type) {
+		if (Bon_Channel >= g_Channel_Base[dwSpace + 1]) {
+			DEBUG_OUTPUT1("end(failed) (channel out of space range)");
+			return FALSE;
+		}
+	}
 
 	// Server request
 	const int len = 128;
 	char url[len];
-	if (g_Service_Split == 1) {
-		const int64_t id = (int64_t)channel_obj["id"].get<double>();
-		sprintf(url, "/api/services/%lld/stream?decode=%d", (long long int)id, g_DecodeB25);
+	try {
+		picojson::object& channel_obj =
+			g_Channel_JSON.get(Bon_Channel).get<picojson::object>();
 
+		if (g_Service_Split == 1) {
+			const int64_t id = (int64_t)channel_obj["id"].get<double>();
+			snprintf(url, sizeof(url), "/api/services/%lld/stream?decode=%d", (long long int)id, g_DecodeB25);
+
+		}
+		else {
+			const char *type = channel_obj["type"].get<std::string>().c_str();
+			const char *channel = channel_obj["channel"].get<std::string>().c_str();
+			snprintf(url, sizeof(url), "/api/channels/%s/%s/stream?decode=%d", type, channel, g_DecodeB25);
+
+		}
 	}
-	else {
-		const char *type = channel_obj["type"].get<std::string>().c_str();
-		const char *channel = channel_obj["channel"].get<std::string>().c_str();
-		sprintf(url, "/api/channels/%s/%s/stream?decode=%d", type, channel, g_DecodeB25);
-
+	catch (const std::exception& e) {
+		// mirakcが想定外のJSON構造を返した場合に、例外をホスト側へ伝播させない
+		ERROR_OUTPUT( "SetChannel: JSON access exception (%s)", e.what() );
+		return FALSE;
 	}
 	DEBUG_OUTPUT( "request:url:%s", url);
 
 	waitForRecvThreadFinish();
 
-	char szHeader[ 64 ];
-	sprintf(szHeader, "Connection: close\r\nX-Mirakurun-Priority: %d", g_Priority);
+	char szHeader[ 128 ];
+	sprintf(szHeader, "Connection: close\r\nX-Mirakurun-Priority: %d\r\nUser-Agent: BonDriver_LinuxMirakc", g_Priority);
 	char respHeader[ 512 ]; // todo
 	int respCode;
 	int rc;
-	rc = conn->sendGetRequest_WaitHeader( url, szHeader, respHeader, &respCode );
+	rc = conn->sendGetRequest_WaitHeader( url, szHeader, respHeader, &respCode, sizeof(respHeader) );
 	if( rc != 0 || respCode != 200 ) {
 		ERROR_OUTPUT( "%s: Tuner unavailable (rc:%d, resp:%d)", g_TunerName, rc, respCode );
 		conn->disconnect();
+		// 失敗した場合、実際には(古いチャンネルも含め)どのチャンネルも受信できていない
+		// 状態になる。ここでリセットしておかないと、直前に成功していた古いチャンネル
+		// 番号がGetCurSpace()/GetCurChannel()から見え続けてしまい、ホスト側が
+		// 「まだ受信中」と誤認する（特にリトライ時に問題になる）。
+		m_dwCurSpace = 0xffffffff;
+		m_dwCurChannel = 0xffffffff;
 		return FALSE;
 	}
 
@@ -451,13 +543,30 @@ const BOOL CBonTuner::SetChannel(const DWORD dwSpace, const DWORD dwChannel)
 	// TSデータパージ
 	PurgeTsStream();
 
+	// 前回CloseTuner()等でシャットダウン要求されたフラグが残っていると、
+	// この新しいセッションのput_TsStream()が即座に失敗してしまうためクリアする
+	if (m_pGrabTsData) {
+		m_pGrabTsData->ResetShutdown();
+	}
+
 	// 受信スレッド起動
 	int ret;
 	ret = pthread_create( &m_hRecvThread, NULL, CBonTuner::RecvThread, (void *)this ); 
-	if( ret < 0 ) {
+	if( ret != 0 ) {
 		ERROR_OUTPUT( "pthread_create error %d", ret);
+		// pthread_createが失敗した場合、*thread(m_hRecvThread)の値はPOSIX上「不定」となる。
+		// 不定値のまま残すと、後続のwaitForRecvThreadFinish()やCloseTuner()が
+		// 存在しないスレッドハンドルをpthread_joinしてしまい、ハング（デッドロック）や
+		// 未定義動作の原因になる。明示的に「スレッドなし」を示す0にリセットする。
+		m_hRecvThread = 0;
+		// ストリームは実際には開始していないので、更新済みのチャンネル情報も戻す
+		m_dwCurSpace = 0xffffffff;
+		m_dwCurChannel = 0xffffffff;
+		// ヘッダー受信までは成功して開いたままの接続を閉じる
+		conn->disconnect();
 		return FALSE;
 	}
+	m_bRecvThreadValid = true;
 
 	DEBUG_OUTPUT1("End(succes)");
 	return TRUE;
@@ -491,48 +600,63 @@ BOOL CBonTuner::InitChannel()
 		return FALSE;
 	}
 
-	// チューニング空間取得
-	int i = 0;
-	int j = -1;
-	while (j < SPACE_NUM - 1) {
-		if (!g_Channel_JSON.contains(i)) {
-			break;
-		}
-		picojson::object& channel_obj =
-			g_Channel_JSON.get(i).get<picojson::object>();
-		const char *type;
-		if (g_Service_Split == 1) {
-			picojson::object& channel_detail =
-				channel_obj["channel"].get<picojson::object>();
-			type = channel_detail["type"].get<std::string>().c_str();
-		}
-		else {
-			type = channel_obj["type"].get<std::string>().c_str();
-		}
-		if (j < 0 || strcmp(g_pType[j], type)) {
-			j++;
-			int len = (int)strlen(type) + 1;
-			g_pType[j] = (char *)malloc(len);
-			if (!g_pType[j]) {
-				j--;
+	try {
+		// チューニング空間取得
+		int i = 0;
+		int j = -1;
+		while (j < SPACE_NUM - 1) {
+			if (!g_Channel_JSON.contains(i)) {
 				break;
 			}
-			strcpy(g_pType[j], type);
-			g_Channel_Base[j] = i;
+			picojson::object& channel_obj =
+				g_Channel_JSON.get(i).get<picojson::object>();
+			const char *type;
+			if (g_Service_Split == 1) {
+				picojson::object& channel_detail =
+					channel_obj["channel"].get<picojson::object>();
+				type = channel_detail["type"].get<std::string>().c_str();
+			}
+			else {
+				type = channel_obj["type"].get<std::string>().c_str();
+			}
+			if (j < 0 || strcmp(g_pType[j], type)) {
+				j++;
+				int len = (int)strlen(type) + 1;
+				g_pType[j] = (char *)malloc(len);
+				if (!g_pType[j]) {
+					j--;
+					break;
+				}
+				strcpy(g_pType[j], type);
+				g_Channel_Base[j] = i;
+			}
+			i++;
 		}
-		i++;
+		if (j < 0) {
+			return FALSE;
+		}
+		g_Max_Type = j;
 	}
-	if (j < 0) {
+	catch (const std::exception& e) {
+		// mirakcが想定外のJSON構造を返した場合に、例外をホスト側へ伝播させない。
+		// ここまでに確保していたg_pTypeがあれば解放してから抜ける。
+		for (int k = 0; k < SPACE_NUM; k++) {
+			if (g_pType[k]) {
+				free(g_pType[k]);
+				g_pType[k] = NULL;
+			}
+		}
+		g_Max_Type = -1;
+		ERROR_OUTPUT( "InitChannel: JSON access exception (%s)", e.what() );
 		return FALSE;
 	}
-	g_Max_Type = j;
 
 	return TRUE;
 }
 
 BOOL CBonTuner::GetApiChannels(picojson::value *channel_json, int service_split)
 {
-	const int len = 14;
+	const int len = 16;
 	char url[len];
 
 	::strcpy(url, "/api/");
@@ -555,6 +679,7 @@ BOOL CBonTuner::GetApiChannels(picojson::value *channel_json, int service_split)
 	picojson::value v;
 	std::string err = picojson::parse(v, data);
 	if (!err.empty()) {
+		free(data);
 		return FALSE;
 	}
 	*channel_json = v;
@@ -574,21 +699,24 @@ BOOL CBonTuner::SendRequest(char *url, char **body, int *bodysize)
 
 		int rc;
 
-		const int len = 64;
+		const int len = 128;
 		char szHeader[len];
-		sprintf(szHeader, "Connection: close\r\nX-Mirakurun-Priority: %d", g_Priority);
+		sprintf(szHeader, "Connection: close\r\nX-Mirakurun-Priority: %d\r\nUser-Agent: BonDriver_LinuxMirakc", g_Priority);
 
 		int respCode;
 		char respHeader[ 512 ]; // todo
-		*body = (char *)malloc( 128 * 1024 ); // todo 128k 
+		const int bodymax = 128 * 1024; // todo 128k
+		*body = (char *)malloc( bodymax );
 
 		DEBUG_OUTPUT( "request:url:%s", url);
 
 		waitForRecvThreadFinish();
 
-		rc = conn->sendGetRequest_WaitBody( url, szHeader, respHeader, &respCode, *body, bodysize );
+		rc = conn->sendGetRequest_WaitBody( url, szHeader, respHeader, &respCode, *body, bodysize, bodymax, sizeof(respHeader) );
 		if( rc != 0 || respCode != 200 ) {
 			ERROR_OUTPUT( "%s: Tuner unavailable (rc:%d, resp:%d)", g_TunerName, rc, respCode );
+			free( *body );
+			*body = NULL;
 			break;
 		}
 
@@ -603,9 +731,12 @@ void *CBonTuner::RecvThread( void *pParam )
 {
 	CBonTuner *pThis = (CBonTuner *)pParam;
 
-	//char buf[ 4096 ];
 	#define BUF_SIZE (188 * 256)
-	char *buf = new char[ BUF_SIZE ];
+	// 手動でのnew[]/delete[]は、将来コードが変更されて早期returnや例外が
+	// 挟まった場合にリークしうる。RAII(std::vector)で確保することで、
+	// どの経路で関数を抜けても確実に解放されるようにする。
+	std::vector<char> buf_storage( BUF_SIZE );
+	char *buf = buf_storage.data();
 
 	int ret;
 	
@@ -622,20 +753,23 @@ void *CBonTuner::RecvThread( void *pParam )
 			break;
 		}
 		
-		pThis->m_pGrabTsData->put_TsStream( (BYTE *)buf, ret );
+		if( !pThis->m_pGrabTsData->put_TsStream( (BYTE *)buf, ret ) ) {
+			// RequestShutdown()によりバッファ待機が中断された（クローズ処理中）
+			pThis->conn->disconnect();
+			break;
+		}
 
 	}
-	
-	delete[] buf;
 
 	return 0;
 }
 
 void CBonTuner::waitForRecvThreadFinish(void)
 {
-	if( m_hRecvThread > 0 ) {
-		pthread_join(m_hRecvThread, NULL); // todo
+	if( m_bRecvThreadValid ) {
+		pthread_join(m_hRecvThread, NULL);
 		m_hRecvThread = 0;
+		m_bRecvThreadValid = false;
 	}
 }
 

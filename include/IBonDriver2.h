@@ -17,6 +17,8 @@
 class IBonDriver2 : public IBonDriver
 {
 public:
+	using IBonDriver::SetChannel;
+
 	virtual LPCTSTR GetTunerName(void) = 0;
 
 	virtual const BOOL IsTunerOpening(void) = 0;

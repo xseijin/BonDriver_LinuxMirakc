@@ -72,9 +72,9 @@ bool Config::Load(const std::string& path)
 			continue;
 		}
 
-		if (p[len] == '\r') {
+		if (len > 0 && p[len - 1] == '\r') {
 			// CRLF
-			p[len--] = '\0';
+			p[--len] = '\0';
 		}
 
 		switch (*p) {
@@ -100,8 +100,14 @@ bool Config::Load(const std::string& path)
 			if (!term)
 				term = p + len;
 
-			util::RTrim(&term, &len);
-			if (!len) {
+			// term は "]" の位置そのもの（1つ先ではない）を指す場合があるため、
+			// RTrim には p〜term 間の実際の長さを渡す（len をそのまま渡すと
+			// "]" 以降の文字数が余分に含まれ、RTrim が p より手前まで
+			// 走査してバッファ外を読みに行く可能性がある）
+			std::size_t seg_len = (std::size_t)(term - p);
+
+			util::RTrim(&term, &seg_len);
+			if (!seg_len) {
 				// invalid section name
 				sct = nullptr;
 				continue;
@@ -137,8 +143,9 @@ bool Config::Load(const std::string& path)
 			util::Trim(&val, &val_len);
 			util::RTrim(&val_term, &val_len);
 
-			if ((val[0] == '\"' && val[val_len - 1] == '\"') ||
-			    (val[0] == '\'' && val[val_len - 1] == '\'')) {
+			if (val_len > 0 &&
+			    ((val[0] == '\"' && val[val_len - 1] == '\"') ||
+			     (val[0] == '\'' && val[val_len - 1] == '\''))) {
 				val[val_len - 1] = L'\0';
 				val++;
 				val_len--;

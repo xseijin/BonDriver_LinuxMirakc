@@ -18,6 +18,7 @@
 #include <sys/un.h>
 
 #include <algorithm>
+#include <cstddef>
 
 #include "logoutput.hpp"
 
@@ -30,20 +31,21 @@ protected:
 	int bufsize;
 
 public:
-	MirakcConnectBase()
+	MirakcConnectBase() : s(-1), bufsize(0)
 	{
 	}
 	virtual ~MirakcConnectBase()
 	{
 		if(s >= 0) {
 			close(s);
+			s = -1;
 		}
 	}
 	
 	virtual int connect() = 0;
 
-	int sendGetRequest_WaitBody( char *url, char *requestHeader, char *responceHeader, int *responceCode, char *body, int *bodysize );
-	int sendGetRequest_WaitHeader( char *url, char *requestHeader, char *responceHeader, int *responceCode );
+	int sendGetRequest_WaitBody( char *url, char *requestHeader, char *responceHeader, int *responceCode, char *body, int *bodysize, int bodymax, int headermax );
+	int sendGetRequest_WaitHeader( char *url, char *requestHeader, char *responceHeader, int *responceCode, int headermax );
 
 	int recvBody( char *body, size_t size );
 
@@ -54,13 +56,9 @@ public:
 class MirakcConnectHttp : public MirakcConnectBase
 {
 private:
-#if 1
 	struct sockaddr_in s_addr;
-#else
-	struct addrinfo hints;
-	struct addrinfo *addr;
-#endif
-	
+	char g_host[256];
+	short g_port;
 public:
 	MirakcConnectHttp( char *host, short port );
 	int connect();
@@ -80,37 +78,24 @@ public:
 
 /*************************************************/
 
-MirakcConnectHttp::MirakcConnectHttp( char *host, short port )
+MirakcConnectHttp::MirakcConnectHttp( char *host, short port ) : g_port(port)
 {
-#if 1
+	strncpy( g_host, host, sizeof(g_host) - 1 );
+	g_host[ sizeof(g_host) - 1 ] = '\0';
 	s_addr.sin_addr.s_addr = inet_addr( host );
 	s_addr.sin_port        = htons( port );
 	s_addr.sin_family      = AF_INET;
-#endif
-
-#if 0
-	memset( &hints, 0, sizeof(hints) );
-	hints.ai_socktype = SOCK_STREAM;
-	hints.ai_family = AF_INET;
-
-	int ret; 
-	
-	ret = getaddrinfo( host, NULL, &hints, &addr );
-	if( ret != 0 ) {
-		// error
-	}
-#endif
 }
 
 
 int MirakcConnectHttp::connect()
 {
-	int ret;
-	
+	if( s >= 0 ) { ::close(s); s = -1; }
+	bufsize = 0;
 	s = socket(AF_INET, SOCK_STREAM, 0);
-
-	ret = ::connect( s, (sockaddr *)&s_addr, sizeof( s_addr ) );
-	
+	if( s < 0 ) return -1;
+	int ret = ::connect( s, (sockaddr *)&s_addr, sizeof( s_addr ) );
+	if( ret < 0 ) { ::close(s); s = -1; }
 	return ret;
 }
 
@@ -132,13 +117,12 @@ MirakcConnectUnix::MirakcConnectUnix( char *path )
 
 int MirakcConnectUnix::connect()
 {
-	int ret;
-	
+	if( s >= 0 ) { ::close(s); s = -1; }
+	bufsize = 0;
 	s = socket(AF_UNIX, SOCK_STREAM, 0);
-
-	//ret = ::connect( s, addr->ai_addr, addr->ai_addrlen );
-	ret = ::connect( s, (sockaddr *)&addr, sizeof( addr ) );
-
+	if( s < 0 ) return -1;
+	int ret = ::connect( s, (sockaddr *)&addr, sizeof( addr ) );
+	if( ret < 0 ) { ::close(s); s = -1; }
 	return ret;
 }
 
@@ -148,33 +132,43 @@ int MirakcConnectUnix::connect()
 void MirakcConnectBase::shutdown()
 {
 	if( s >= 0 ) {
-		::shutdown(s, SHUT_WR);
+		// SHUT_WR（書き込み側）のみでは、mirakc側がまだTSデータを送信し続けている限り、
+		// 別スレッド(RecvThread)がブロックしている recv() は起きない。
+		// 結果として waitForRecvThreadFinish() の pthread_join() が永久に戻らず、
+		// デッドロック（ハング）する。
+		// SHUT_RDWR（読み込み側も含める）にすると、同じfdでブロック中のrecv()を
+		// close()せずに即座に0で復帰させられるため、これを使う
+		// （close()での強制解放はfd番号が別スレッドの新しい接続に再利用される
+		//   レースの危険があるため避ける）。
+		::shutdown(s, SHUT_RDWR);
 	}
 
 }
 
 void MirakcConnectBase::disconnect()
 {
-	if( s >= 0 ) {
-	
-		::close(s);
-	}
-	s = -1;
+	if( s >= 0 ) { ::close(s); s = -1; }
+	bufsize = 0;
 }
 
-int MirakcConnectBase::sendGetRequest_WaitBody( char *url, char *requestHeader, char *responceHeader, int *responceCode, char *body, int *bodysize )
+int MirakcConnectBase::sendGetRequest_WaitBody( char *url, char *requestHeader, char *responceHeader, int *responceCode, char *body, int *bodysize, int bodymax, int headermax )
 {
 	int ret;
 	int state = 0;
 	char *p_startbody = body;
+	// bodymax/headermax はターミネータ用の1バイトを含めた「呼び出し側が確保したバッファ全体のサイズ」
+	// これを超えてコピーしないようにする（呼び出し側バッファのオーバーフロー対策）
+	char *p_bodylimit = p_startbody + ( bodymax > 0 ? bodymax - 1 : 0 ); // ヌル終端分を1バイト確保
+	char *p_headerstart = responceHeader;
+	char *p_headerlimit = p_headerstart + ( headermax > 0 ? headermax - 1 : 0 );
 
 	ret = connect();
 	if( ret < 0 ) {
 		return -errno - 2000;
 	}
 
-	char send_string[ 2024 ];
-	::sprintf( send_string, "GET %s HTTP/1.0\r\n%s\r\n\r\n", url, requestHeader );
+	char send_string[ 4096 ];
+	::snprintf( send_string, sizeof(send_string), "GET %s HTTP/1.0\r\nHost: localhost\r\n%s\r\n\r\n", url, requestHeader );
 
 	ret = ::send( s, send_string, strlen( send_string ), 0 );
 	if( ret < 0 ) {
@@ -196,54 +190,129 @@ int MirakcConnectBase::sendGetRequest_WaitBody( char *url, char *requestHeader, 
 		}
 		buf[ ret ] = 0;
 
-		if( state == 0 ) { // state reading
-			char *p;
-			p = ::strchr( buf, ' ' );
-			*responceCode = ::atoi( p + 1 );
-			state = 1;
-		}
-		if( state == 1 ){ // break through
-			char *p;
-			
-			p = ::strstr( buf, "\r\n\r\n" );
-			if( p != NULL ) {
-				p += 4;
-				::memcpy( responceHeader, buf, p - buf );
-				responceHeader += p - buf;
-				*responceHeader = 0;
-
-				::memmove( buf, p, ret - ( p - buf ) );
-				ret = ret - ( p - buf );
-
-				state = 2;
-			
+		// 1xx暫定応答の読み飛ばし、およびヘッダー終端直後に届いた本文データを
+		// recv()を挟まずに同じチャンク内で処理し切るための内側ループ
+		for(;;) {
+			if( state == 0 ) { // state reading
+				char *p;
+				p = ::strchr( buf, ' ' );
+				if( p == NULL ) {
+					// ステータス行が不正（スペースが見つからない）
+					ERROR_OUTPUT1( "sendGetRequest_WaitBody: malformed status line" );
+					disconnect();
+					return -1;
+				}
+				*responceCode = ::atoi( p + 1 );
+				state = 1;
 			}
-			else {
-				::memcpy( responceHeader, buf, ret );
-				responceHeader += ret;
+			if( state == 1 ){ // break through
+				char *p;
+				
+				p = ::strstr( buf, "\r\n\r\n" );
+				if( p != NULL ) {
+					int hlen = (int)(p + 4 - buf);
+					int rest = ret - hlen;
+
+					if( *responceCode >= 100 && *responceCode <= 199 ) {
+						// 1xx (例: 100 Continue) は暫定応答。破棄して次の本応答を待つ
+						DEBUG_OUTPUT( "sendGetRequest_WaitBody: skip 1xx interim response (%d)", *responceCode );
+						responceHeader = p_headerstart; // ヘッダー蓄積位置をリセット
+						state = 0;
+						if( rest > 0 ) {
+							// 続きのデータが同じrecv()チャンクに含まれている可能性があるため、
+							// recv()を待たずにその場で再解析する
+							::memmove( buf, buf + hlen, rest );
+							ret = rest;
+							buf[ ret ] = 0;
+							continue;
+						}
+						else {
+							// 続きはまだ届いていないので、次のrecv()を待つ
+							break;
+						}
+					}
+
+					// 通常（1xxでない）の最終応答としてヘッダーを確定する
+					{
+						ptrdiff_t hremain = p_headerlimit - responceHeader;
+						if( hremain < 0 ) hremain = 0;
+						ptrdiff_t hcopy = hlen;
+						if( hcopy > hremain ) {
+							ERROR_OUTPUT( "sendGetRequest_WaitBody: response header exceeds buffer (max:%d), truncating", headermax );
+							hcopy = hremain;
+						}
+						if( hcopy > 0 ) {
+							::memcpy( responceHeader, buf, hcopy );
+							responceHeader += hcopy;
+						}
+					}
+					*responceHeader = 0;
+
+					state = 2;
+
+					if( rest > 0 ) {
+						// ヘッダーの直後に届いた本文データを取りこぼさないよう、
+						// このまま下のstate==2処理に流し込む
+						::memmove( buf, buf + hlen, rest );
+						ret = rest;
+					}
+					else {
+						ret = 0;
+					}
+				}
+				else {
+					ptrdiff_t hremain = p_headerlimit - responceHeader;
+					if( hremain < 0 ) hremain = 0;
+					ptrdiff_t hcopy = ret;
+					if( hcopy > hremain ) {
+						ERROR_OUTPUT( "sendGetRequest_WaitBody: response header exceeds buffer (max:%d), truncating", headermax );
+						hcopy = hremain;
+					}
+					if( hcopy > 0 ) {
+						::memcpy( responceHeader, buf, hcopy );
+						responceHeader += hcopy;
+					}
+				}
 			}
-		}
-		
-		if( state == 2 ) { // ここはelseif
-			::memcpy( body, buf, ret );
-			body += ret;
+
+			if( state == 2 ) {
+				if( ret > 0 ) {
+					// 呼び出し側バッファの残り容量を超える分は破棄する（オーバーフロー防止）
+					ptrdiff_t remain = p_bodylimit - body;
+					if( remain < 0 ) remain = 0;
+					int copylen = ret;
+					if( (ptrdiff_t)copylen > remain ) {
+						ERROR_OUTPUT( "sendGetRequest_WaitBody: response body exceeds buffer (max:%d), truncating", bodymax );
+						copylen = (int)remain;
+					}
+					if( copylen > 0 ) {
+						::memcpy( body, buf, copylen );
+						body += copylen;
+					}
+				}
+			}
+
+			break; // 内側ループを抜けて外側のrecv()へ
 		}
 	}
 	// not reached
 }
 
 
-int MirakcConnectBase::sendGetRequest_WaitHeader( char *url, char *requestHeader, char *responceHeader, int *responceCode )
+int MirakcConnectBase::sendGetRequest_WaitHeader( char *url, char *requestHeader, char *responceHeader, int *responceCode, int headermax )
 {
 	int ret;
 	int state = 0;
+	char *p_headerstart = responceHeader;
+	// headermax はターミネータ用の1バイトを含めた「呼び出し側が確保したバッファ全体のサイズ」
+	char *p_headerlimit = p_headerstart + ( headermax > 0 ? headermax - 1 : 0 );
 
 	ret = connect();
 	if( ret < 0 ) {
 		return -errno - 2000;
 	}
-	char send_string[ 2024 ];
-	::sprintf( send_string, "GET %s HTTP/1.0\r\n%s\r\n\r\n", url, requestHeader );
+	char send_string[ 4096 ];
+	::snprintf( send_string, sizeof(send_string), "GET %s HTTP/1.0\r\nHost: localhost\r\n%s\r\n\r\n", url, requestHeader );
 
 	ret = ::send( s, send_string, strlen( send_string ), 0 );
 	if( ret < 0 ) {
@@ -262,37 +331,87 @@ int MirakcConnectBase::sendGetRequest_WaitHeader( char *url, char *requestHeader
 		}
 		buf[ ret ] = 0;
 
-		if( state == 0 ) { // state reading
-			char *p;
-			p = ::strchr( buf, ' ' );
-			*responceCode = ::atoi( p + 1 );
-			state = 1;
-		}
-		if( state == 1 ){ // break through
-			char *p;
-			
-			p = ::strstr( buf, "\r\n\r\n" );
-			if( p != NULL ) {
-				p += 4;
-				::memcpy( responceHeader, buf, p - buf );
-				responceHeader += p - buf;
-				*responceHeader = 0;
-
-				::memmove( buf, p, ret - ( p - buf ) );
-				ret = ret - ( p - buf );
-
-				state = 2;
-			
+		// 1xx暫定応答の読み飛ばし用の内側ループ（recv()を挟まずに同一チャンクを再解析する）
+		for(;;) {
+			if( state == 0 ) { // state reading
+				char *p;
+				p = ::strchr( buf, ' ' );
+				if( p == NULL ) {
+					// ステータス行が不正（スペースが見つからない）
+					ERROR_OUTPUT1( "sendGetRequest_WaitHeader: malformed status line" );
+					close(s);
+					s = -1;
+					return -1;
+				}
+				*responceCode = ::atoi( p + 1 );
+				state = 1;
 			}
-			else {
-				::memcpy( responceHeader, buf, ret );
-				responceHeader += ret;
+			if( state == 1 ){ // break through
+				char *p;
+				
+				p = ::strstr( buf, "\r\n\r\n" );
+				if( p != NULL ) {
+					int hlen = (int)(p + 4 - buf);
+					int body_in_chunk = ret - hlen;
+
+					if( *responceCode >= 100 && *responceCode <= 199 ) {
+						// 1xx (例: 100 Continue) は暫定応答。破棄して次の本応答を待つ
+						DEBUG_OUTPUT( "sendGetRequest_WaitHeader: skip 1xx interim response (%d)", *responceCode );
+						responceHeader = p_headerstart; // ヘッダー蓄積位置をリセット
+						state = 0;
+						if( body_in_chunk > 0 ) {
+							// 続きのデータが同じrecv()チャンクに含まれている可能性があるため、
+							// recv()を待たずにその場で再解析する
+							::memmove( buf, buf + hlen, body_in_chunk );
+							ret = body_in_chunk;
+							buf[ ret ] = 0;
+							continue;
+						}
+						else {
+							// 続きはまだ届いていないので、次のrecv()を待つ
+							break;
+						}
+					}
+
+					// ヘッダーバッファの残り容量を超える分は破棄する（オーバーフロー防止）
+					ptrdiff_t hremain = p_headerlimit - responceHeader;
+					if( hremain < 0 ) hremain = 0;
+					ptrdiff_t hcopy = hlen;
+					if( hcopy > hremain ) {
+						ERROR_OUTPUT( "sendGetRequest_WaitHeader: response header exceeds buffer (max:%d), truncating", headermax );
+						hcopy = hremain;
+					}
+					if( hcopy > 0 ) {
+						::memcpy( responceHeader, buf, hcopy );
+						responceHeader += hcopy;
+					}
+					*responceHeader = 0;
+					if( body_in_chunk > 0 ) {
+						::memmove( buf, buf + hlen, body_in_chunk );
+						bufsize = body_in_chunk;
+					} else {
+						bufsize = 0;
+					}
+					state = 2;
+				}
+				else {
+					ptrdiff_t hremain = p_headerlimit - responceHeader;
+					if( hremain < 0 ) hremain = 0;
+					ptrdiff_t hcopy = ret;
+					if( hcopy > hremain ) {
+						ERROR_OUTPUT( "sendGetRequest_WaitHeader: response header exceeds buffer (max:%d), truncating", headermax );
+						hcopy = hremain;
+					}
+					if( hcopy > 0 ) {
+						::memcpy( responceHeader, buf, hcopy );
+						responceHeader += hcopy;
+					}
+				}
 			}
-		}
-		if( state == 2 ) { // 
-			bufsize = ret;
-			
-			return 0; // !
+			if( state == 2 ) {
+				return 0; // !
+			}
+			break; // 内側ループを抜けて外側のrecv()へ
 		}
 	}
 	// not reached
@@ -301,14 +420,18 @@ int MirakcConnectBase::sendGetRequest_WaitHeader( char *url, char *requestHeader
 int MirakcConnectBase::recvBody( char *body, size_t size )
 {
 	if( bufsize > 0 ){
-		int len;
-
-		len = std::min( (size_t)bufsize, size );
-
+		int len = (int)std::min( (size_t)bufsize, size );
 		::memcpy( body, buf, len );
+		if( bufsize - len > 0 ) ::memmove( buf, buf + len, bufsize - len );
 		bufsize -= len;
-
 		return len;
+	}
+
+	// 既に切断済み（s == -1）の場合は recv() を呼ばない。
+	// close()済みのfd番号は他スレッドの新しい接続に再利用され得るため、
+	// 無効な状態のまま recv() を呼び続けるのは危険（状態不整合）。
+	if( s < 0 ) {
+		return 0; // 切断済みとして扱う（呼び出し元のRecvThreadはこれをdisconnect扱いする）
 	}
 
 	int ret;

@@ -20,7 +20,7 @@ public:
 	CharCodeConv(const CharCodeConv&) = delete;
 	CharCodeConv& operator=(const CharCodeConv&) = delete;
 
-	bool Utf8ToUtf16(const char *src, WCHAR *dst);
+	bool Utf8ToUtf16(const char *src, WCHAR *dst, size_t dst_size_bytes);
 
 private:
 	::iconv_t cd_;

@@ -10,6 +10,7 @@
 
 #include <stdexcept>
 #include <string.h>
+#include <errno.h>
 
 CharCodeConv::CharCodeConv()
 {
@@ -24,18 +25,24 @@ CharCodeConv::~CharCodeConv()
 		::iconv_close(cd_);
 }
 
-bool CharCodeConv::Utf8ToUtf16(const char *src, WCHAR *dst)
+bool CharCodeConv::Utf8ToUtf16(const char *src, WCHAR *dst, size_t dst_size_bytes)
 {
 	char *s = (char *)src;
 	size_t s_len = ::strlen( src );
 
-	size_t d_len = s_len * sizeof(WCHAR);
-	memset( dst, 0, d_len + sizeof(WCHAR) );
+	// 呼び出し側バッファを超えて書き込まない。ヌル終端用に最低1 WCHAR分は残す
+	if( dst_size_bytes < sizeof(WCHAR) ) {
+		return false;
+	}
 
+	memset( dst, 0, dst_size_bytes );
+
+	size_t d_len = dst_size_bytes - sizeof(WCHAR); // ヌル終端分を確保
 	size_t cr = ::iconv(cd_, &s, &s_len, (char **)&dst, &d_len);
-	if (cr == (size_t)-1)
+	if (cr == (size_t)-1 && errno != E2BIG)
 		return false;
 
+	// E2BIGの場合は入りきる分だけ変換され、残りは切り捨てられる（バッファ保護優先）
 	return true;
 }
 

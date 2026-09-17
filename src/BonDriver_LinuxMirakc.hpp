@@ -90,6 +90,10 @@ protected:
 	CharCodeConv m_cv;
 	MirakcConnectBase *conn;
 	pthread_t m_hRecvThread;
+	// pthread_t は不透明な型で、演算子(> や真偽判定)による有効性チェックは
+	// ポータブルではない（POSIX上、比較や0との比較が定義されていない）。
+	// そのため有効なスレッドを保持しているかどうかは別途このフラグで管理する。
+	bool m_bRecvThreadValid;
 
 	void waitForRecvThreadFinish(void);
 };
