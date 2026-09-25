@@ -10,6 +10,9 @@
 #include <exception>
 #include <vector>
 
+// g_TunerName の実体(宣言は BonDriver_LinuxMirakc.hpp / logoutput.hpp)
+char g_TunerName[128];
+
 static void Init_set_default_value(void);
 
 static int Init()

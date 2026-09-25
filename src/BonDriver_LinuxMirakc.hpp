@@ -18,7 +18,12 @@
 
 #define TUNER_NAME "LinuxMirakc"
 
-char g_TunerName[128];
+// 注意: このヘッダのstatic変数は翻訳単位ごとに別のコピーになる。
+// BonDriver_LinuxMirakc.cpp 以外からincludeしないこと(他から状態を参照する場合は
+// extern宣言+実体1か所の形に移す)。
+// g_TunerName は logoutput.hpp からも extern 参照されるため、宣言のみここに置き、
+// 実体は BonDriver_LinuxMirakc.cpp に1つだけ定義する(ヘッダでの多重定義を避ける)。
+extern char g_TunerName[128];
 
 #define MAX_HOST_LEN 256
 static char g_ServerHost[MAX_HOST_LEN];
@@ -32,7 +37,7 @@ static int g_Service_Split;
 static char *g_pType[SPACE_NUM];
 static int g_Max_Type = -1;
 static DWORD g_Channel_Base[SPACE_NUM];
-picojson::value g_Channel_JSON;
+static picojson::value g_Channel_JSON; // 他の翻訳単位・他の.soコピーとシンボルが衝突しないようstatic
 
 static char g_ServerSockpath[ PATH_MAX + 1 ];
 static char g_ServerType[ 16 ]; // "http" / "unix"。長い値が途中で切れて別の値に化けないよう余裕を持たせる
