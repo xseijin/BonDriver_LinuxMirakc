@@ -11,6 +11,7 @@
 
 //#include <atomic>
 #include <pthread.h>
+#include <new>
 
 #define MAX_PATH 256
 
@@ -40,6 +41,13 @@ public:
 		m_bShutdown = false;
 		m_pDst = (BYTE *)malloc(DATA_BUF_SIZE);
 		m_pBuf = (BYTE *)malloc(RING_BUF_SIZE);
+		if (!m_pDst || !m_pBuf) {
+			// NULLのまま使うとmemcpyでクラッシュするため、構築失敗として扱う
+			// (コンストラクタで例外を投げるとデストラクタは呼ばれないのでここで解放する)
+			::free(m_pDst);
+			::free(m_pBuf);
+			throw std::bad_alloc();
+		}
 
 		// Wait_TsStream()のタイムアウト計算はCLOCK_MONOTONICを使う。
 		// デフォルト(CLOCK_REALTIME)だと、NTP補正やシステム時刻の手動変更で

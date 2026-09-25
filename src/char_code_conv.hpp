@@ -5,6 +5,7 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
 #include <string>
 
 #include <iconv.h>
@@ -24,5 +25,7 @@ public:
 
 private:
 	::iconv_t cd_;
+	// iconv_tは内部状態を持つため、複数スレッドから同時に使うと競合する
+	std::mutex mtx_;
 };
 

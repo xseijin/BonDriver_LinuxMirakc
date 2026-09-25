@@ -2,6 +2,7 @@
 //   modified by matching
 
 #include <limits.h>
+#include <atomic>
 
 #include "type_compat.h"
 #include "IBonDriver2.h"
@@ -34,7 +35,7 @@ static DWORD g_Channel_Base[SPACE_NUM];
 picojson::value g_Channel_JSON;
 
 static char g_ServerSockpath[ PATH_MAX + 1 ];
-static char g_ServerType[ 4 + 1 ];
+static char g_ServerType[ 16 ]; // "http" / "unix"。長い値が途中で切れて別の値に化けないよう余裕を持たせる
 
 class CBonTuner : public IBonDriver2
 {
@@ -73,6 +74,8 @@ public:
 	void Release(void);
 
 	static CBonTuner *m_pThis;
+	// CreateBonDriver()が既存インスタンスを共有して返した回数。Release()で0になったら開放する
+	std::atomic<int> m_refCount;
 
 protected:
 	GrabTsData *m_pGrabTsData;

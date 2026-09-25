@@ -11,6 +11,8 @@
 #include <cstring>
 #include <algorithm>
 #include <fstream>
+#include <string>
+#include <vector>
 
 #include "util.hpp"
 
@@ -41,7 +43,20 @@ std::string Config::Section::Get(const std::string& key, const std::string& defa
 int Config::Section::Get(const std::string& key, int default_value) const
 {
 	try {
-		return std::stoi(Get(key), nullptr, 0);
+		// 基数0(自動判定)だと "010" が8進数の8、"08080" が0になってしまう。
+		// 先頭の0を含む10進表記をそのまま読めるよう、10進固定とし、
+		// 明示的な "0x" 接頭辞のみ16進として扱う。
+		const std::string& v = Get(key);
+		std::size_t i = 0;
+		while (i < v.size() && (v[i] == ' ' || v[i] == '\t'))
+			i++;
+		std::size_t j = i;
+		if (j < v.size() && (v[j] == '+' || v[j] == '-'))
+			j++;
+		int base = 10;
+		if (j + 1 < v.size() && v[j] == '0' && (v[j + 1] == 'x' || v[j + 1] == 'X'))
+			base = 16;
+		return std::stoi(v, nullptr, base);
 	} catch (const std::out_of_range&) {
 		return default_value;
 	} catch (const std::invalid_argument&) {
@@ -57,14 +72,22 @@ bool Config::Load(const std::string& path)
 	if (!ifs.is_open())
 		return false;
 
-	while (true) {
-		char line[256], *p = line;
-		std::size_t len;
+	std::string line_str;
+	std::vector<char> line_buf;
 
-		if (!ifs.getline(line, 256))
-			break;
+	// 行の長さに上限を設けない(固定長バッファだと長い行でfailbitが立ち、
+	// 以降の設定が黙って読まれなくなる)
+	while (std::getline(ifs, line_str)) {
+		line_buf.assign(line_str.begin(), line_str.end());
+		line_buf.push_back('\0');
 
-		len = std::strlen(line);
+		char *p = line_buf.data();
+		std::size_t len = std::strlen(p);
+
+		// CRLFの'\r'は、空行判定や前後の空白除去より先に取り除く
+		while (len > 0 && p[len - 1] == '\r') {
+			p[--len] = '\0';
+		}
 
 		util::Trim(&p, &len);
 		if (!len) {
@@ -72,13 +95,9 @@ bool Config::Load(const std::string& path)
 			continue;
 		}
 
-		if (len > 0 && p[len - 1] == '\r') {
-			// CRLF
-			p[--len] = '\0';
-		}
-
 		switch (*p) {
 		case ';':
+		case '#':
 			// comment
 			continue;
 
@@ -141,14 +160,28 @@ bool Config::Load(const std::string& path)
 			util::RTrim(&key_term, &key_len);
 
 			util::Trim(&val, &val_len);
-			util::RTrim(&val_term, &val_len);
 
-			if (val_len > 0 &&
-			    ((val[0] == '\"' && val[val_len - 1] == '\"') ||
-			     (val[0] == '\'' && val[val_len - 1] == '\''))) {
-				val[val_len - 1] = L'\0';
-				val++;
-				val_len--;
+			if (val_len > 0 && (val[0] == '\"' || val[0] == '\'')) {
+				// 引用符付きの値。閉じ引用符までを値とし、その後ろ(インラインコメント等)は無視する
+				char *close = std::strchr(val + 1, val[0]);
+				if (close) {
+					*close = '\0';
+					val++;
+					val_len = (std::size_t)(close - val);
+				} else {
+					util::RTrim(&val_term, &val_len);
+				}
+			} else {
+				// 引用符なしの値。空白の後ろの ';' または '#' 以降はインラインコメント
+				for (std::size_t k = 1; k < val_len; k++) {
+					if ((val[k] == ';' || val[k] == '#') && (val[k - 1] == ' ' || val[k - 1] == '\t')) {
+						val[k] = '\0';
+						val_len = k;
+						val_term = val + k;
+						break;
+					}
+				}
+				util::RTrim(&val_term, &val_len);
 			}
 
 			sct->Set(key, val);

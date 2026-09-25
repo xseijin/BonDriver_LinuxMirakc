@@ -78,7 +78,9 @@ static int Init()
 	g_Service_Split = sec_global.Get("SERVICE_SPLIT", 0 );
 
 	strncpy( g_ServerSockpath, sec_global.Get("SERVER_SOCKPATH", "").c_str(), sizeof( g_ServerSockpath ) - 1 );
+	g_ServerSockpath[ sizeof( g_ServerSockpath ) - 1 ] = '\0';
 	strncpy( g_ServerType, sec_global.Get("SERVER_TYPE", "http").c_str(), sizeof( g_ServerType ) - 1 );
+	g_ServerType[ sizeof( g_ServerType ) - 1 ] = '\0';
 
 	return 0;
 }
@@ -91,6 +93,7 @@ static void Init_set_default_value(void)
 	g_Priority = 1;
 	g_Service_Split = 0;
 
+	g_ServerSockpath[0] = '\0';
 	strcpy( g_ServerType, "http" );
 }
 
@@ -103,6 +106,8 @@ extern "C" IBonDriver * CreateBonDriver()
 {
 	try {
 		if( CBonTuner::m_pThis != NULL ) {
+			// 既存インスタンスを共有して返す。Release()の二重deleteを避けるため参照カウントを増やす
+			CBonTuner::m_pThis->m_refCount++;
 			return CBonTuner::m_pThis;
 		}
 		
@@ -145,7 +150,7 @@ CBonTuner::CBonTuner()
 {
 	DEBUG_CALL("");
 
-	m_pThis = this;
+	m_refCount = 1;
 	m_dwCurSpace = 0xffffffff;
 	m_dwCurChannel = 0xffffffff;
 
@@ -153,10 +158,13 @@ CBonTuner::CBonTuner()
 	m_bRecvThreadValid = false;
 
 	conn = NULL;
+	m_pGrabTsData = NULL;
 
 	// GrabTsDataインスタンス作成
 	m_pGrabTsData = new GrabTsData();
 
+	// 例外で構築に失敗した場合にm_pThisがぶら下がらないよう、最後に設定する
+	m_pThis = this;
 }
 
 CBonTuner::~CBonTuner()
@@ -236,18 +244,7 @@ void CBonTuner::CloseTuner()
 	m_dwCurChannel = 0xffffffff;
 
 	// スレッド終了
-	if (m_bRecvThreadValid) {
-		conn->shutdown();
-		// conn->shutdown()はソケットI/O(recv())のブロックしか解除できない。
-		// 送信スレッドがリングバッファ満杯でput_TsStream()内のpthread_cond_wait
-		// にブロックしている場合はこれでは起きないため、別途明示的に知らせる。
-		if (m_pGrabTsData) {
-			m_pGrabTsData->RequestShutdown();
-		}
-		pthread_join(m_hRecvThread, NULL);
-		m_hRecvThread = 0;
-		m_bRecvThreadValid = false;
-	}
+	waitForRecvThreadFinish();
 
 	// チューニング空間解放
 	for (int i = 0; i <= g_Max_Type; i++) {
@@ -345,6 +342,12 @@ void CBonTuner::Release()
 	DEBUG_CALL("");
 	DEBUG_OUTPUT1("Called");
 
+	// CreateBonDriver()が同じインスタンスを複数回返している場合があるため、
+	// 最後の参照が解放されたときだけ実際に開放する
+	if (--m_refCount > 0) {
+		return;
+	}
+
 	// インスタンス開放
 	delete this;
 }
@@ -379,7 +382,9 @@ LPCTSTR CBonTuner::EnumTuningSpace(const DWORD dwSpace)
 {
 	DEBUG_CALL("");
 
-	if ((int32_t)dwSpace > g_Max_Type) {
+	// dwSpaceはDWORD(符号なし)のまま比較する。int32_tにキャストすると
+	// 0x80000000以上が負数になって検査をすり抜け、g_pType[]を範囲外参照してしまう
+	if (g_Max_Type < 0 || dwSpace > (DWORD)g_Max_Type) {
 		return NULL;
 	}
 
@@ -398,14 +403,18 @@ LPCTSTR CBonTuner::EnumChannelName(const DWORD dwSpace, const DWORD dwChannel)
 {
 	DEBUG_CALL("");
 
-	if ((int32_t)dwSpace > g_Max_Type) {
+	if (g_Max_Type < 0 || dwSpace > (DWORD)g_Max_Type) {
 		return NULL;
 	}
 	DWORD Bon_Channel = dwChannel + g_Channel_Base[dwSpace];
+	if (Bon_Channel < g_Channel_Base[dwSpace]) {
+		// dwChannelが巨大でDWORDがラップアラウンドした
+		return NULL;
+	}
 	if (!g_Channel_JSON.contains(Bon_Channel)) {
 		return NULL;
 	}
-	if ((int32_t)dwSpace < g_Max_Type) {
+	if (dwSpace < (DWORD)g_Max_Type) {
 		if (Bon_Channel >= g_Channel_Base[dwSpace + 1]) {
 			return NULL;
 		}
@@ -470,20 +479,25 @@ const BOOL CBonTuner::SetChannel(const DWORD dwSpace, const DWORD dwChannel)
 		return FALSE;
 	}
 
-	conn->shutdown();
-
-	if ((int32_t)dwSpace > g_Max_Type) {
+	// 引数の検証が済むまでは、受信中のストリームには触れない。
+	// (先にshutdownしてしまうと、無効なチャンネル指定で FALSE を返しても
+	//  実際には今のストリームだけが切れてしまう)
+	if (g_Max_Type < 0 || dwSpace > (DWORD)g_Max_Type) {
 		DEBUG_OUTPUT("end(failed) (sp:%d, spmax:%d)", dwSpace, g_Max_Type);
 		return FALSE;
 	}
 
 	DWORD Bon_Channel = dwChannel + g_Channel_Base[dwSpace];
+	if (Bon_Channel < g_Channel_Base[dwSpace]) {
+		DEBUG_OUTPUT1("end(failed) (channel overflow)");
+		return FALSE;
+	}
 	if (!g_Channel_JSON.contains(Bon_Channel)) {
 		DEBUG_OUTPUT1("end(failed) (invalid channel)");
 		return FALSE;
 	}
 	// dwChannel が次のチューニング空間にはみ出していないかチェック（EnumChannelNameと同様）
-	if ((int32_t)dwSpace < g_Max_Type) {
+	if (dwSpace < (DWORD)g_Max_Type) {
 		if (Bon_Channel >= g_Channel_Base[dwSpace + 1]) {
 			DEBUG_OUTPUT1("end(failed) (channel out of space range)");
 			return FALSE;
@@ -516,12 +530,14 @@ const BOOL CBonTuner::SetChannel(const DWORD dwSpace, const DWORD dwChannel)
 	}
 	DEBUG_OUTPUT( "request:url:%s", url);
 
+	// 受信中のスレッドを停止して合流する。バッファ満杯で待機中でも確実に止まる
+	// (waitForRecvThreadFinish内でソケットのshutdownとバッファ待機の中断を両方行う)
 	waitForRecvThreadFinish();
 
 	char szHeader[ 128 ];
-	sprintf(szHeader, "Connection: close\r\nX-Mirakurun-Priority: %d\r\nUser-Agent: BonDriver_LinuxMirakc", g_Priority);
+	snprintf(szHeader, sizeof(szHeader), "Connection: close\r\nX-Mirakurun-Priority: %d\r\nUser-Agent: BonDriver_LinuxMirakc", g_Priority);
 	char respHeader[ 512 ]; // todo
-	int respCode;
+	int respCode = 0;
 	int rc;
 	rc = conn->sendGetRequest_WaitHeader( url, szHeader, respHeader, &respCode, sizeof(respHeader) );
 	if( rc != 0 || respCode != 200 ) {
@@ -542,12 +558,6 @@ const BOOL CBonTuner::SetChannel(const DWORD dwSpace, const DWORD dwChannel)
 
 	// TSデータパージ
 	PurgeTsStream();
-
-	// 前回CloseTuner()等でシャットダウン要求されたフラグが残っていると、
-	// この新しいセッションのput_TsStream()が即座に失敗してしまうためクリアする
-	if (m_pGrabTsData) {
-		m_pGrabTsData->ResetShutdown();
-	}
 
 	// 受信スレッド起動
 	int ret;
@@ -604,7 +614,7 @@ BOOL CBonTuner::InitChannel()
 		// チューニング空間取得
 		int i = 0;
 		int j = -1;
-		while (j < SPACE_NUM - 1) {
+		for (;;) {
 			if (!g_Channel_JSON.contains(i)) {
 				break;
 			}
@@ -620,6 +630,11 @@ BOOL CBonTuner::InitChannel()
 				type = channel_obj["type"].get<std::string>().c_str();
 			}
 			if (j < 0 || strcmp(g_pType[j], type)) {
+				if (j + 1 >= SPACE_NUM) {
+					// これ以上チューニング空間を作れない(最後の空間には
+					// そのタイプの全チャンネルを割り当てるためここで打ち切る)
+					break;
+				}
 				j++;
 				int len = (int)strlen(type) + 1;
 				g_pType[j] = (char *)malloc(len);
@@ -691,39 +706,33 @@ BOOL CBonTuner::GetApiChannels(picojson::value *channel_json, int service_split)
 
 BOOL CBonTuner::SendRequest(char *url, char **body, int *bodysize)
 {
-	BOOL ret = FALSE;
+	int rc;
 
-	conn->shutdown();
+	char szHeader[ 128 ];
+	snprintf(szHeader, sizeof(szHeader), "Connection: close\r\nX-Mirakurun-Priority: %d\r\nUser-Agent: BonDriver_LinuxMirakc", g_Priority);
 
-	while (1) {
+	int respCode = 0;
+	char respHeader[ 512 ]; // todo
+	// チャンネル/サービス一覧の上限。本文は必要に応じて伸長して受信する
+	const int bodymax = 32 * 1024 * 1024;
 
-		int rc;
+	DEBUG_OUTPUT( "request:url:%s", url);
 
-		const int len = 128;
-		char szHeader[len];
-		sprintf(szHeader, "Connection: close\r\nX-Mirakurun-Priority: %d\r\nUser-Agent: BonDriver_LinuxMirakc", g_Priority);
+	waitForRecvThreadFinish();
 
-		int respCode;
-		char respHeader[ 512 ]; // todo
-		const int bodymax = 128 * 1024; // todo 128k
-		*body = (char *)malloc( bodymax );
-
-		DEBUG_OUTPUT( "request:url:%s", url);
-
-		waitForRecvThreadFinish();
-
-		rc = conn->sendGetRequest_WaitBody( url, szHeader, respHeader, &respCode, *body, bodysize, bodymax, sizeof(respHeader) );
-		if( rc != 0 || respCode != 200 ) {
-			ERROR_OUTPUT( "%s: Tuner unavailable (rc:%d, resp:%d)", g_TunerName, rc, respCode );
+	*body = NULL;
+	*bodysize = 0;
+	rc = conn->sendGetRequest_WaitBody( url, szHeader, respHeader, &respCode, body, bodysize, bodymax, sizeof(respHeader) );
+	if( rc != 0 || respCode != 200 ) {
+		ERROR_OUTPUT( "%s: Tuner unavailable (rc:%d, resp:%d)", g_TunerName, rc, respCode );
+		if( *body ) {
 			free( *body );
 			*body = NULL;
-			break;
 		}
-
-		return TRUE;
+		return FALSE;
 	}
 
-	return ret;
+	return TRUE;
 }
 
 
@@ -742,20 +751,20 @@ void *CBonTuner::RecvThread( void *pParam )
 	
 	for(;;) {
 	
+		// ここではソケットをclose()しない。close()は別スレッドのshutdown()と競合して
+		// 再利用されたfdを誤って操作する恐れがあるため、スレッド終了後に
+		// 制御側(SetChannel/CloseTuner)がdisconnect()する。
 		ret = pThis->conn->recvBody( buf, BUF_SIZE );
 		if( ret == 0 ) { // disconnect
-			pThis->conn->disconnect();
 			break;
 		}
 		else if( ret < 0 ) { // error
-			ERROR_OUTPUT("recv error (%d)\n\n", ret );
-			pThis->conn->disconnect();
+			ERROR_OUTPUT("recv error (%d)", ret );
 			break;
 		}
-		
+
 		if( !pThis->m_pGrabTsData->put_TsStream( (BYTE *)buf, ret ) ) {
 			// RequestShutdown()によりバッファ待機が中断された（クローズ処理中）
-			pThis->conn->disconnect();
 			break;
 		}
 
@@ -767,9 +776,23 @@ void *CBonTuner::RecvThread( void *pParam )
 void CBonTuner::waitForRecvThreadFinish(void)
 {
 	if( m_bRecvThreadValid ) {
+		// ソケットI/O(recv())でのブロックを解除する
+		if( conn ) {
+			conn->shutdown();
+		}
+		// 受信スレッドがリングバッファ満杯でput_TsStream()のpthread_cond_waitに
+		// 入っている場合、shutdown()では起きない。明示的に中断を知らせる。
+		if( m_pGrabTsData ) {
+			m_pGrabTsData->RequestShutdown();
+		}
 		pthread_join(m_hRecvThread, NULL);
 		m_hRecvThread = 0;
 		m_bRecvThreadValid = false;
+		// 受信スレッドはもういないので、次のセッションのput_TsStream()が
+		// 即座に失敗しないよう要求フラグをクリアする
+		if( m_pGrabTsData ) {
+			m_pGrabTsData->ResetShutdown();
+		}
 	}
 }
 

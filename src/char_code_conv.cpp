@@ -37,6 +37,11 @@ bool CharCodeConv::Utf8ToUtf16(const char *src, WCHAR *dst, size_t dst_size_byte
 
 	memset( dst, 0, dst_size_bytes );
 
+	std::lock_guard<std::mutex> lock( mtx_ );
+
+	// 前回の変換(E2BIG等)の状態が残らないようリセットする
+	::iconv(cd_, NULL, NULL, NULL, NULL);
+
 	size_t d_len = dst_size_bytes - sizeof(WCHAR); // ヌル終端分を確保
 	size_t cr = ::iconv(cd_, &s, &s_len, (char **)&dst, &d_len);
 	if (cr == (size_t)-1 && errno != E2BIG)
