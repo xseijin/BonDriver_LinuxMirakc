@@ -433,7 +433,7 @@ LPCTSTR CBonTuner::EnumChannelName(const DWORD dwSpace, const DWORD dwChannel)
 		// スレッドごとに独立したバッファにして、複数スレッドからの同時呼び出しによる
 		// 内容の競合・破損を防ぐ
 		thread_local WCHAR buf[len];
-		m_cv.Utf8ToUtf16( channel_obj["name"].get<std::string>().c_str(), buf, sizeof(buf) );
+		m_cv.Utf8ToUtf16( channel_obj.at("name").get<std::string>().c_str(), buf, sizeof(buf) );
 
 		return buf;
 	}
@@ -515,13 +515,13 @@ const BOOL CBonTuner::SetChannel(const DWORD dwSpace, const DWORD dwChannel)
 			g_Channel_JSON.get(Bon_Channel).get<picojson::object>();
 
 		if (g_Service_Split == 1) {
-			const int64_t id = (int64_t)channel_obj["id"].get<double>();
+			const int64_t id = (int64_t)channel_obj.at("id").get<double>();
 			snprintf(url, sizeof(url), "/api/services/%lld/stream?decode=%d", (long long int)id, g_DecodeB25);
 
 		}
 		else {
-			const char *type = channel_obj["type"].get<std::string>().c_str();
-			const char *channel = channel_obj["channel"].get<std::string>().c_str();
+			const char *type = channel_obj.at("type").get<std::string>().c_str();
+			const char *channel = channel_obj.at("channel").get<std::string>().c_str();
 			snprintf(url, sizeof(url), "/api/channels/%s/%s/stream?decode=%d", type, channel, g_DecodeB25);
 
 		}
@@ -626,11 +626,11 @@ BOOL CBonTuner::InitChannel()
 			const char *type;
 			if (g_Service_Split == 1) {
 				picojson::object& channel_detail =
-					channel_obj["channel"].get<picojson::object>();
-				type = channel_detail["type"].get<std::string>().c_str();
+					channel_obj.at("channel").get<picojson::object>();
+				type = channel_detail.at("type").get<std::string>().c_str();
 			}
 			else {
-				type = channel_obj["type"].get<std::string>().c_str();
+				type = channel_obj.at("type").get<std::string>().c_str();
 			}
 			if (j < 0 || strcmp(g_pType[j], type)) {
 				if (j + 1 >= SPACE_NUM) {
