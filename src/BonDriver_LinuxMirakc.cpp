@@ -6,12 +6,17 @@
 #include "logoutput.hpp"
 
 #include <string.h>
+#include <stdlib.h>
+#include <errno.h>
 #include <dlfcn.h>
 #include <exception>
 #include <vector>
 
 // g_TunerName の実体(宣言は BonDriver_LinuxMirakc.hpp / logoutput.hpp)
 char g_TunerName[128];
+
+// ストリーム受信中の無通信タイムアウト(秒)の既定値
+#define DEFAULT_STREAM_TIMEOUT_SEC 10
 
 static void Init_set_default_value(void);
 
@@ -58,8 +63,21 @@ static int Init()
 	// load ini file
 	Config config;
 	Config::Section sec_global;
+	bool ini_loaded = false;
 
-	if( config.Load( ini_filename ) == false ) {
+	// 環境変数 BONDRIVER_MIRAKC_INI でiniのパスを指定できる(複数チューナーで共通のiniを使う等)。
+	// 読めない場合は従来どおり「.soのパス + ".ini"」にフォールバックする
+	const char *env_ini = getenv( "BONDRIVER_MIRAKC_INI" );
+	if( env_ini != NULL && env_ini[0] != '\0' ) {
+		if( config.Load( env_ini ) ) {
+			ini_loaded = true;
+		}
+		else {
+			ERROR_OUTPUT("ini file(%s) from BONDRIVER_MIRAKC_INI not found. try %s", env_ini, ini_filename);
+		}
+	}
+
+	if( !ini_loaded && config.Load( ini_filename ) == false ) {
 		ERROR_OUTPUT("ini file(%s) not found. load default value", ini_filename);
 		Init_set_default_value();
 		return 0;
@@ -79,6 +97,12 @@ static int Init()
 	g_DecodeB25 = sec_global.Get("DECODE_B25", 0 );
 	g_Priority = sec_global.Get("PRIORITY", 1 );
 	g_Service_Split = sec_global.Get("SERVICE_SPLIT", 0 );
+	// ストリーム受信中の無通信タイムアウト(秒)。既定10秒、0で無効。範囲外(0〜3600以外)は既定値
+	g_StreamTimeoutSec = sec_global.Get("STREAM_TIMEOUT", DEFAULT_STREAM_TIMEOUT_SEC );
+	if( g_StreamTimeoutSec < 0 || g_StreamTimeoutSec > 3600 ) {
+		ERROR_OUTPUT("STREAM_TIMEOUT(%d) out of range (0-3600). use default %d", g_StreamTimeoutSec, DEFAULT_STREAM_TIMEOUT_SEC);
+		g_StreamTimeoutSec = DEFAULT_STREAM_TIMEOUT_SEC;
+	}
 
 	strncpy( g_ServerSockpath, sec_global.Get("SERVER_SOCKPATH", "").c_str(), sizeof( g_ServerSockpath ) - 1 );
 	g_ServerSockpath[ sizeof( g_ServerSockpath ) - 1 ] = '\0';
@@ -95,6 +119,7 @@ static void Init_set_default_value(void)
 	g_DecodeB25 = 0;
 	g_Priority = 1;
 	g_Service_Split = 0;
+	g_StreamTimeoutSec = DEFAULT_STREAM_TIMEOUT_SEC;
 
 	g_ServerSockpath[0] = '\0';
 	strcpy( g_ServerType, "http" );
@@ -130,6 +155,7 @@ extern "C" IBonDriver * CreateBonDriver()
 		DEBUG_OUTPUT("DECODE_B25:%d", g_DecodeB25);
 		DEBUG_OUTPUT("PRIORITY:%d", g_Priority);
 		DEBUG_OUTPUT("SERVICE_SPLIT:%d", g_Service_Split);
+		DEBUG_OUTPUT("STREAM_TIMEOUT:%d", g_StreamTimeoutSec);
 
 		return (IBonDriver *) new CBonTuner;
 	}
@@ -210,6 +236,7 @@ const BOOL CBonTuner::OpenTuner()
 			ERROR_OUTPUT( "%s: Server Type Invalid (%s)", g_TunerName, g_ServerType );
 			break;
 		}
+		conn->setStreamTimeout( g_StreamTimeoutSec * 1000 );
 		
 		if( conn->connect() < 0 ) {
 			ERROR_OUTPUT( "%s: Connect error (%s)(%s)(%d)(%s)", g_TunerName, g_ServerType, g_ServerHost, g_ServerPort, g_ServerSockpath );
@@ -762,7 +789,9 @@ void *CBonTuner::RecvThread( void *pParam )
 			break;
 		}
 		else if( ret < 0 ) { // error
-			ERROR_OUTPUT("recv error (%d)", ret );
+			int e = -ret - 10000; // recvBody()は -errno-10000 を返す
+			ERROR_OUTPUT("recv error: %s (errno=%d)%s", mirakcErrnoMessage( e ).c_str(), e,
+				( e == ETIMEDOUT ) ? " [no data within STREAM_TIMEOUT, or peer unresponsive]" : "" );
 			break;
 		}
 

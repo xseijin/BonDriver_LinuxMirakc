@@ -16,3 +16,10 @@ PRIORITY=10
 ; Service Split(1=enable)
 SERVICE_SPLIT=0
 
+
+; Stream idle timeout in seconds. If no data arrives for this long after the
+; stream has started, the receive thread stops and logs the error (default 10, 0=disable)
+STREAM_TIMEOUT=10
+
+; The ini path can also be given by the environment variable BONDRIVER_MIRAKC_INI
+; (falls back to "<this .so path>.ini" when the file cannot be read).

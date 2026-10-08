@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <string>
+#include <system_error>
 
 #include "logoutput.hpp"
 
@@ -32,6 +33,27 @@
 #define MIRAKC_IO_TIMEOUT_MS 10000
 // レスポンスヘッダの最大サイズ
 #define MIRAKC_HEADER_MAX_TOTAL ( 64 * 1024 )
+
+// errnoを人が読める文字列にする(スレッドセーフ)
+static inline std::string mirakcErrnoMessage( int e )
+{
+	return std::error_code( e, std::generic_category() ).message();
+}
+
+// 接続失敗時によくあるerrnoについて、原因の見当がつくヒントを返す
+static inline const char *mirakcErrnoHint( int e )
+{
+	switch( e ) {
+	case ENOENT:       return "(socket path does not exist; is the server running / the path mounted?)";
+	case EACCES:
+	case EPERM:        return "(permission denied; check socket file permissions and the running user)";
+	case ECONNREFUSED: return "(connection refused; the server is not listening)";
+	case ETIMEDOUT:    return "(timed out)";
+	case EHOSTUNREACH:
+	case ENETUNREACH:  return "(host/network unreachable)";
+	default:           return "";
+	}
+}
 
 /*
  * スレッドに関する注意:
@@ -47,15 +69,17 @@ protected:
 
 	char buf[ 188 * 256 + 1 ];
 	int bufsize;
+	int stream_timeout_ms; // ストリーム受信中の無通信タイムアウト(ms)。0=無効
 
 	int connectFd( int fd, const struct sockaddr *addr, socklen_t addrlen, int timeout_ms );
 	void setIoTimeout( int ms );
+	void setStreamOptions();
 	int sendRequest( const char *url, const char *requestHeader );
 	int recvHeader( char *responceHeader, int *responceCode, int headermax );
 	static ssize_t recvRetry( int fd, char *b, size_t n );
 
 public:
-	MirakcConnectBase() : s(-1), bufsize(0)
+	MirakcConnectBase() : s(-1), bufsize(0), stream_timeout_ms(0)
 	{
 	}
 	virtual ~MirakcConnectBase()
@@ -67,6 +91,10 @@ public:
 	}
 
 	virtual int connect() = 0;
+
+	// ストリーム受信中に一定時間データが来ない場合、recvBody()が -ETIMEDOUT-10000 で復帰するようにする。
+	// 0で無効。sendGetRequest_WaitHeader()の前に設定すること
+	void setStreamTimeout( int ms ) { stream_timeout_ms = ( ms > 0 ) ? ms : 0; }
 
 	// *body はmalloc()で確保され、呼び出し側がfree()する。常にNUL終端される
 	int sendGetRequest_WaitBody( const char *url, const char *requestHeader, char *responceHeader, int *responceCode, char **body, int *bodysize, int bodymax, int headermax );
@@ -154,6 +182,15 @@ void MirakcConnectBase::setIoTimeout( int ms )
 	::setsockopt( s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof( tv ) );
 }
 
+// ストリーム受信フェーズ用のソケット設定。
+// 無通信タイムアウト(0=無効)を設定する。有効なら、データが途絶えた(相手が無応答のHalf-Open含む)
+// ストリームでrecv()がEAGAINで復帰し、recvBody()が -ETIMEDOUT-10000 を返す
+void MirakcConnectBase::setStreamOptions()
+{
+	if( s < 0 ) return;
+	setIoTimeout( stream_timeout_ms );
+}
+
 ssize_t MirakcConnectBase::recvRetry( int fd, char *b, size_t n )
 {
 	ssize_t ret;
@@ -207,6 +244,8 @@ int MirakcConnectHttp::connect()
 		::close( fd );
 	}
 	::freeaddrinfo( res );
+	ERROR_OUTPUT( "connect(%s:%s) failed: %s (errno=%d) %s", g_host.c_str(), portstr,
+		mirakcErrnoMessage( last_errno ).c_str(), last_errno, mirakcErrnoHint( last_errno ) );
 	errno = last_errno;
 	return -1;
 }
@@ -244,6 +283,8 @@ int MirakcConnectUnix::connect()
 	if( connectFd( fd, (sockaddr *)&addr, sizeof( addr ), MIRAKC_CONNECT_TIMEOUT_MS ) < 0 ) {
 		int e = errno;
 		::close( fd );
+		ERROR_OUTPUT( "connect(unix:%s) failed: %s (errno=%d) %s", addr.sun_path,
+			mirakcErrnoMessage( e ).c_str(), e, mirakcErrnoHint( e ) );
 		errno = e;
 		return -1;
 	}
@@ -438,8 +479,9 @@ int MirakcConnectBase::sendGetRequest_WaitHeader( const char *url, const char *r
 		return ret;
 	}
 
-	// ヘッダ受信後はストリームを受け続けるので、無通信タイムアウトは解除する
-	setIoTimeout( 0 );
+	// ヘッダ受信後はストリームを受け続けるので、ヘッダ用の短いタイムアウトは解除し、
+	// ストリーム用の無通信タイムアウトに切り替える
+	setStreamOptions();
 	return 0;
 }
 
@@ -461,7 +503,10 @@ int MirakcConnectBase::recvBody( char *body, size_t size )
 	ssize_t ret = recvRetry( s, body, size );
 
 	if( ret < 0 ) {
-		return -errno - 10000;
+		int e = errno;
+		// SO_RCVTIMEO(無通信タイムアウト)満了はEAGAIN/EWOULDBLOCKで返るので、ETIMEDOUTとして扱う
+		if( e == EAGAIN || e == EWOULDBLOCK ) e = ETIMEDOUT;
+		return -e - 10000;
 	}
 
 	return (int)ret;
