@@ -33,12 +33,12 @@ BOOL GrabTsData::put_TsStream(BYTE *pSrc, DWORD dwSize)
 		for(;;) {
 			nPush = m_nPush;
 			nPull = m_nPull;
-			nAvail = (RING_BUF_SIZE - 1) - (RING_BUF_SIZE + nPush - nPull) % RING_BUF_SIZE;
-			// nPush/nPullが常に[0, RING_BUF_SIZE)に収まっている限り理論上は
+			nAvail = (m_nRingSize - 1) - (m_nRingSize + nPush - nPull) % m_nRingSize;
+			// nPush/nPullが常に[0, m_nRingSize)に収まっている限り理論上は
 			// 起こらないが、万一この不変条件が崩れた場合、符号なし演算の
 			// アンダーフローでnAvailが巨大な値(約4GB)になり、後続のmemcpyで
 			// ヒープバッファオーバーフローを起こしかねない。安全側にクランプする。
-			if( nAvail > (DWORD)(RING_BUF_SIZE - 1) ) {
+			if( nAvail > (DWORD)(m_nRingSize - 1) ) {
 				nAvail = 0;
 			}
 			if( nAvail >= dwSize ) break;
@@ -52,11 +52,11 @@ BOOL GrabTsData::put_TsStream(BYTE *pSrc, DWORD dwSize)
 		}
 		m_nAccumData += dwSize;
 		// mutexを保持したままコピーしてインデックスを更新する
-		nTail = RING_BUF_SIZE - nPush;
+		nTail = m_nRingSize - nPush;
 		if( dwSize <= nTail ) {
 			::memcpy( m_pBuf + nPush, pSrc, dwSize );
 			nPush += dwSize;
-			if( nPush >= RING_BUF_SIZE ) nPush = 0;
+			if( nPush >= m_nRingSize ) nPush = 0;
 		} else {
 			::memcpy( m_pBuf + nPush, pSrc, nTail );
 			::memcpy( m_pBuf, pSrc + nTail, dwSize - nTail );
@@ -102,8 +102,8 @@ BOOL GrabTsData::get_TsStream(BYTE **ppDst, DWORD *pdwSize, DWORD *pdwRemain)
 	::pthread_mutex_unlock( &m_pRingMutex );
 
 	// copy TS data to the destination buffer
-	DWORD nTail = RING_BUF_SIZE - nPull; // size between the current position and the buffer end
-	DWORD nData = (RING_BUF_SIZE + nPush - nPull) % RING_BUF_SIZE; // size of TS data stored
+	DWORD nTail = m_nRingSize - nPull; // size between the current position and the buffer end
+	DWORD nData = (m_nRingSize + nPush - nPull) % m_nRingSize; // size of TS data stored
 	DWORD nRemain = nData;
 	if (nData > 0) {
 		nData = std::min(nData, (DWORD)DATA_BUF_SIZE);
@@ -144,6 +144,7 @@ BOOL GrabTsData::get_TsStream(BYTE **ppDst, DWORD *pdwSize, DWORD *pdwRemain)
 		m_bReading = false;
 	}
 	::pthread_mutex_unlock( &m_pRingMutex );
+
 
 	// set destination variables
 	if (ppDst) {
@@ -218,7 +219,7 @@ BOOL GrabTsData::get_ReadyCount(DWORD *pdwRemain)
 		}
 		::pthread_mutex_unlock( &m_pRingMutex );
 	
-		*pdwRemain = CEIL((RING_BUF_SIZE + nPush - nPull) % RING_BUF_SIZE, DATA_BUF_SIZE);
+		*pdwRemain = CEIL((m_nRingSize + nPush - nPull) % m_nRingSize, DATA_BUF_SIZE);
 	}
 
 	return TRUE;
@@ -316,4 +317,3 @@ DWORD GrabTsData::Wait_TsStream(DWORD waitMs)
 
 	return ret;
 }
-

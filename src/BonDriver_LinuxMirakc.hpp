@@ -3,6 +3,7 @@
 
 #include <limits.h>
 #include <atomic>
+#include <mutex>
 
 #include "type_compat.h"
 #include "IBonDriver2.h"
@@ -32,6 +33,7 @@ static uint32_t g_ServerPort;
 static int g_DecodeB25;
 static int g_Priority;
 static int g_Service_Split;
+static int g_BufferSize;
 
 #define SPACE_NUM 8
 static char *g_pType[SPACE_NUM];
@@ -98,6 +100,12 @@ protected:
 	CharCodeConv m_cv;
 	MirakcConnectBase *conn;
 	pthread_t m_hRecvThread;
+	// OpenTuner/CloseTuner/SetChannelを直列化する。別スレッドから同時に呼ばれると、
+	// 受信スレッドのjoinが二重になったり、使用中のconnをdeleteしてしまうため。
+	// OpenTuner()→CloseTuner()、SetChannel(BYTE)→SetChannel(DWORD,DWORD)のように
+	// 内部で互いを呼ぶため再帰ミューテックスにする。受信スレッドはこのロックを取らない
+	// (CloseTuner中のjoinで自分自身を待つデッドロックを避ける)。
+	std::recursive_mutex m_ctrlMutex;
 	// pthread_t は不透明な型で、演算子(> や真偽判定)による有効性チェックは
 	// ポータブルではない（POSIX上、比較や0との比較が定義されていない）。
 	// そのため有効なスレッドを保持しているかどうかは別途このフラグで管理する。

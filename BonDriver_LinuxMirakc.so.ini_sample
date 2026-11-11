@@ -16,3 +16,6 @@ PRIORITY=10
 ; Service Split(1=enable)
 SERVICE_SPLIT=0
 
+; Ring buffer size in bytes (default 134217728 = 128MB, range 65536 - 1073741824)
+; Increase it for high-bitrate (4K) streams or when the host reads slowly.
+; BUFFER_SIZE=134217728

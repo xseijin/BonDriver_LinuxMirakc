@@ -9,11 +9,13 @@
 #include <dlfcn.h>
 #include <exception>
 #include <vector>
+#include <algorithm>
 
 // g_TunerName の実体(宣言は BonDriver_LinuxMirakc.hpp / logoutput.hpp)
 char g_TunerName[128];
 
 static void Init_set_default_value(void);
+static bool timedJoin(pthread_t th, int timeoutMs);
 
 static int Init()
 {
@@ -79,6 +81,10 @@ static int Init()
 	g_DecodeB25 = sec_global.Get("DECODE_B25", 0 );
 	g_Priority = sec_global.Get("PRIORITY", 1 );
 	g_Service_Split = sec_global.Get("SERVICE_SPLIT", 0 );
+	g_BufferSize = sec_global.Get("BUFFER_SIZE", 1024 * 1024 * 128 );
+	// リングバッファの容量。極端な値でメモリ確保に失敗したりDWORD演算があふれたりしないよう範囲内に収める
+	g_BufferSize = std::max( g_BufferSize, (int)RING_BUF_SIZE_MIN );
+	g_BufferSize = std::min( g_BufferSize, (int)RING_BUF_SIZE_MAX );
 
 	strncpy( g_ServerSockpath, sec_global.Get("SERVER_SOCKPATH", "").c_str(), sizeof( g_ServerSockpath ) - 1 );
 	g_ServerSockpath[ sizeof( g_ServerSockpath ) - 1 ] = '\0';
@@ -95,6 +101,7 @@ static void Init_set_default_value(void)
 	g_DecodeB25 = 0;
 	g_Priority = 1;
 	g_Service_Split = 0;
+	g_BufferSize = 1024 * 1024 * 128;
 
 	g_ServerSockpath[0] = '\0';
 	strcpy( g_ServerType, "http" );
@@ -131,6 +138,8 @@ extern "C" IBonDriver * CreateBonDriver()
 		DEBUG_OUTPUT("PRIORITY:%d", g_Priority);
 		DEBUG_OUTPUT("SERVICE_SPLIT:%d", g_Service_Split);
 
+		DEBUG_OUTPUT("BUFFER_SIZE:%d", g_BufferSize);
+
 		return (IBonDriver *) new CBonTuner;
 	}
 	catch (const std::exception& e) {
@@ -164,7 +173,7 @@ CBonTuner::CBonTuner()
 	m_pGrabTsData = NULL;
 
 	// GrabTsDataインスタンス作成
-	m_pGrabTsData = new GrabTsData();
+	m_pGrabTsData = new GrabTsData( (size_t)g_BufferSize );
 
 	// 例外で構築に失敗した場合にm_pThisがぶら下がらないよう、最後に設定する
 	m_pThis = this;
@@ -187,6 +196,7 @@ CBonTuner::~CBonTuner()
 
 const BOOL CBonTuner::OpenTuner()
 {
+	std::lock_guard<std::recursive_mutex> ctrl_lock( m_ctrlMutex );
 	DEBUG_CALL("");
 
 	DEBUG_OUTPUT1("Start");
@@ -239,6 +249,7 @@ const BOOL CBonTuner::OpenTuner()
 
 void CBonTuner::CloseTuner()
 {
+	std::lock_guard<std::recursive_mutex> ctrl_lock( m_ctrlMutex );
 	DEBUG_CALL("");
 	DEBUG_OUTPUT1("Start");
 
@@ -473,6 +484,7 @@ const BOOL CBonTuner::SetChannel(const BYTE bCh)
 // チャンネル設定
 const BOOL CBonTuner::SetChannel(const DWORD dwSpace, const DWORD dwChannel)
 {
+	std::lock_guard<std::recursive_mutex> ctrl_lock( m_ctrlMutex );
 	DEBUG_CALL("");
 	DEBUG_OUTPUT("Start(sp:%d, ch:%d)", dwSpace, dwChannel);
 
@@ -743,21 +755,27 @@ void *CBonTuner::RecvThread( void *pParam )
 {
 	CBonTuner *pThis = (CBonTuner *)pParam;
 
-	#define BUF_SIZE (188 * 256)
+	#define RECV_SIZE_MAX (1024 * 128)
+
+	// 1回の受信サイズは、BUFFER_SIZEの1/10か128KBの小さいほう(128KBあれば十分)。
 	// 手動でのnew[]/delete[]は、将来コードが変更されて早期returnや例外が
 	// 挟まった場合にリークしうる。RAII(std::vector)で確保することで、
 	// どの経路で関数を抜けても確実に解放されるようにする。
-	std::vector<char> buf_storage( BUF_SIZE );
+	int buf_size = std::min(g_BufferSize / 10, RECV_SIZE_MAX);
+	std::vector<char> buf_storage( buf_size );
 	char *buf = buf_storage.data();
 
 	int ret;
 	
+	unsigned long long nSizeTotal = 0;
+	unsigned long nTotalRecv = 0;
+
 	for(;;) {
 	
 		// ここではソケットをclose()しない。close()は別スレッドのshutdown()と競合して
 		// 再利用されたfdを誤って操作する恐れがあるため、スレッド終了後に
 		// 制御側(SetChannel/CloseTuner)がdisconnect()する。
-		ret = pThis->conn->recvBody( buf, BUF_SIZE );
+		ret = pThis->conn->recvBody( buf, buf_size );
 		if( ret == 0 ) { // disconnect
 			break;
 		}
@@ -771,7 +789,11 @@ void *CBonTuner::RecvThread( void *pParam )
 			break;
 		}
 
+		nSizeTotal += ret;
+		nTotalRecv ++;
 	}
+
+	DEBUG_OUTPUT( "RecvThread finished. Total size: %llu, Total recv: %lu, Avg: %llu", nSizeTotal, nTotalRecv, nTotalRecv > 0 ? nSizeTotal / nTotalRecv : 0 );
 
 	return 0;
 }
@@ -788,7 +810,14 @@ void CBonTuner::waitForRecvThreadFinish(void)
 		if( m_pGrabTsData ) {
 			m_pGrabTsData->RequestShutdown();
 		}
-		pthread_join(m_hRecvThread, NULL);
+
+		// 5000msでjoinできるか確認する。できなくても、切断と中断は上で要求済みなので
+		// 最終的にはjoinで待つ(ここでは遅延の検知とログ出力だけを行う)
+		if( timedJoin(m_hRecvThread, 5000) == false ) {
+			ERROR_OUTPUT1("RecvThread not finished within 5000ms. waiting...");
+			pthread_join(m_hRecvThread, NULL);
+		}
+
 		m_hRecvThread = 0;
 		m_bRecvThreadValid = false;
 		// 受信スレッドはもういないので、次のセッションのput_TsStream()が
@@ -799,3 +828,15 @@ void CBonTuner::waitForRecvThreadFinish(void)
 	}
 }
 
+static bool timedJoin(pthread_t th, int timeoutMs)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_REALTIME, &ts);
+	ts.tv_sec += timeoutMs / 1000;
+	ts.tv_nsec += (long)(timeoutMs % 1000) * 1000000L;
+	if( ts.tv_nsec >= 1000000000L ) {
+		ts.tv_sec++;
+		ts.tv_nsec -= 1000000000L;
+	}
+	return pthread_timedjoin_np(th, NULL, &ts) == 0;
+}

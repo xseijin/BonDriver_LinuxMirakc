@@ -26,6 +26,8 @@
 
 #include "logoutput.hpp"
 
+// 受信用バッファのサイズ(4K等の高ビットレートストリーム向け)
+#define HTTP_BUFFER_SIZE (1024 * 1024 * 1)
 // 接続確立のタイムアウト(ms)
 #define MIRAKC_CONNECT_TIMEOUT_MS 5000
 // ヘッダ/APIボディ受信中の無通信タイムアウト(ms)。ストリーム受信中は無効にする
@@ -45,8 +47,11 @@ class MirakcConnectBase
 protected:
 	int s; // socket
 
-	char buf[ 188 * 256 + 1 ];
+	char buf[ HTTP_BUFFER_SIZE + 1 ];
 	int bufsize;
+
+	// リクエストに付与する "Host: xxx" 行(CRLFなし)。ホスト名(最大256)+ポート+括弧分の余裕を持たせる
+	char hostHeader[ 320 ];
 
 	int connectFd( int fd, const struct sockaddr *addr, socklen_t addrlen, int timeout_ms );
 	void setIoTimeout( int ms );
@@ -57,6 +62,9 @@ protected:
 public:
 	MirakcConnectBase() : s(-1), bufsize(0)
 	{
+		s = -1;
+		bufsize = 0;
+		strcpy( hostHeader, "Host: localhost" );
 	}
 	virtual ~MirakcConnectBase()
 	{
@@ -167,6 +175,13 @@ ssize_t MirakcConnectBase::recvRetry( int fd, char *b, size_t n )
 
 MirakcConnectHttp::MirakcConnectHttp( const char *host, int port ) : g_host( host ? host : "" ), g_port( port )
 {
+	// Hostヘッダ。IPv6リテラル(":"を含む)は"[...]"で囲む
+	if( g_host.find( ':' ) != std::string::npos ) {
+		::snprintf( hostHeader, sizeof( hostHeader ), "Host: [%s]:%d", g_host.c_str(), port );
+	}
+	else {
+		::snprintf( hostHeader, sizeof( hostHeader ), "Host: %s:%d", g_host.c_str(), port );
+	}
 }
 
 
@@ -227,6 +242,9 @@ MirakcConnectUnix::MirakcConnectUnix( const char *path ) : path_too_long(false)
 		// 接続時にエラーとする
 		path_too_long = true;
 	}
+
+	/* Unix Domain Socket は固定設定*/
+	::snprintf( hostHeader, sizeof( hostHeader ), "Host: localhost:40772" );
 }
 
 
@@ -273,7 +291,7 @@ void MirakcConnectBase::disconnect()
 int MirakcConnectBase::sendRequest( const char *url, const char *requestHeader )
 {
 	char send_string[ 4096 ];
-	int len = ::snprintf( send_string, sizeof(send_string), "GET %s HTTP/1.0\r\nHost: localhost\r\n%s\r\n\r\n", url, requestHeader );
+	int len = ::snprintf( send_string, sizeof(send_string), "GET %s HTTP/1.0\r\n%s\r\n%s\r\n\r\n", url, hostHeader, requestHeader );
 	if( len < 0 || (size_t)len >= sizeof( send_string ) ) {
 		ERROR_OUTPUT1( "request too long" );
 		return -1;

@@ -19,8 +19,12 @@
 
 // TS data buffer size
 //
-#define DATA_BUF_SIZE (188 * 256)
-#define RING_BUF_SIZE (DATA_BUF_SIZE * 512) // > 24Mbps / 8bit * 5sec
+//#define DATA_BUF_SIZE (188 * 256)
+#define DATA_BUF_SIZE (1024 * 1024 * 1)
+// リングバッファの容量は固定ではなく、コンストラクタの引数(INIのBUFFER_SIZE)で決める。
+// 目安: 24Mbps / 8bit * 5sec = 15MB 以上。4Kなど高ビットレートでは余裕を持たせる。
+#define RING_BUF_SIZE_MIN (64 * 1024)
+#define RING_BUF_SIZE_MAX (1024 * 1024 * 1024) // DWORD演算でオーバーフローしない範囲(2GB未満)に収める
 
 // GrabTsData class
 //
@@ -29,8 +33,11 @@ class GrabTsData
 public:
 	// Constructor
 //	GrabTsData(HANDLE *phOnStreamEvent)
-	GrabTsData()
+	GrabTsData(size_t ringSize)
 	{
+		if (ringSize < RING_BUF_SIZE_MIN) ringSize = RING_BUF_SIZE_MIN;
+		if (ringSize > RING_BUF_SIZE_MAX) ringSize = RING_BUF_SIZE_MAX;
+		m_nRingSize = (DWORD)ringSize;
 //		m_phOnStreamEvent = phOnStreamEvent;
 		m_nAccumData = 0;
 		m_bPurge = FALSE;
@@ -40,7 +47,7 @@ public:
 		m_bReading = false;
 		m_bShutdown = false;
 		m_pDst = (BYTE *)malloc(DATA_BUF_SIZE);
-		m_pBuf = (BYTE *)malloc(RING_BUF_SIZE);
+		m_pBuf = (BYTE *)malloc(m_nRingSize);
 		if (!m_pDst || !m_pBuf) {
 			// NULLのまま使うとmemcpyでクラッシュするため、構築失敗として扱う
 			// (コンストラクタで例外を投げるとデストラクタは呼ばれないのでここで解放する)
@@ -145,4 +152,7 @@ private:
 
 	BYTE *m_pDst;
 	BYTE *m_pBuf;
+
+	// リングバッファの容量(バイト)
+	DWORD m_nRingSize;
 };
