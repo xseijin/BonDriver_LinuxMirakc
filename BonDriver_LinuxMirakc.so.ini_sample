@@ -16,6 +16,14 @@ PRIORITY=10
 ; Service Split(1=enable)
 SERVICE_SPLIT=0
 
+
+; Stream idle timeout in seconds. If no data arrives for this long after the
+; stream has started, the receive thread stops and logs the error (default 10, 0=disable)
+STREAM_TIMEOUT=10
+
+; The ini path can also be given by the environment variable BONDRIVER_MIRAKC_INI
+; (falls back to "<this .so path>.ini" when the file cannot be read).
+
 ; Ring buffer size in bytes (default 134217728 = 128MB, range 65536 - 1073741824)
 ; Increase it for high-bitrate (4K) streams or when the host reads slowly.
 ; BUFFER_SIZE=134217728

@@ -33,6 +33,7 @@ static uint32_t g_ServerPort;
 static int g_DecodeB25;
 static int g_Priority;
 static int g_Service_Split;
+static int g_StreamTimeoutSec; // ストリーム受信中の無通信タイムアウト(秒)。0=無効 (既定値はBonDriver_LinuxMirakc.cpp)
 static int g_BufferSize;
 
 #define SPACE_NUM 8
